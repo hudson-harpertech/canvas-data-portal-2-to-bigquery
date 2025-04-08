@@ -4,6 +4,7 @@ import os
 import logging
 import glob
 import json
+import time
 import shutil
 from google.cloud import bigquery
 
@@ -30,11 +31,26 @@ def run_dap_command(command, namespace="canvas"):
         client_id = os.getenv("API_KEY")
         client_secret = os.getenv("API_SECRET")
 
-        result = subprocess.run(f"dap --base-url {base_url} --client-id {client_id} --client-secret {client_secret} {command} --namespace {namespace}", 
-                                check=True, shell=True, text=True, capture_output=True)
+        full_command = (
+            f"dap --base-url {base_url} "
+            f"--client-id {client_id} "
+            f"--client-secret {client_secret} "
+            f"{command} --namespace {namespace}"
+        )
+
+        result = subprocess.run(full_command, check=True, shell=True, text=True, capture_output=True, timeout=180)
+        
+        if result.stdout.strip():
+            logging.debug(f"DAP stdout:\n{result.stdout}")
+        if result.stderr.strip():
+            logging.debug(f"DAP stderr:\n{result.stderr}")
+
         return result.stdout
+    except subprocess.TimeoutExpired:
+        logging.error(f"Timeout occurred running command: {command}")
+        return None
     except subprocess.CalledProcessError as e:
-        print(f"Error running command '{command}': {e.output}")
+        logging.error(f"Error running command '{command}': {e.stderr}")
         return None
 
 def list_tables():
@@ -237,36 +253,39 @@ if not tables:
 
 for table in tables:
     try:
-        # Download table data
-        download_table_data(table)
+        # Respect DAP rate limit (5 snapshot requests per minute)
+        time.sleep(15)
 
+        download_table_data(table)
         job_id = get_job_id()
 
-        # Find the downloaded parquet file
+        if not job_id:
+            logging.warning(f"No job directory found for table {table}. Skipping.")
+            continue
+
         parquet_files = glob.glob(f'downloads/{job_id}/*.parquet')
         if not parquet_files:
-            print(f"No parquet files found for job {job_id}.")
+            logging.warning(f"No parquet files found for table '{table}' (job: {job_id}). Skipping.")
             continue
+
         parquet_file = parquet_files[0]
-
         table_ref = client.dataset(os.getenv("DATASET")).table(table)
-
-        # Load parquet file into BigQuery
         job_config = bigquery.LoadJobConfig(source_format=bigquery.SourceFormat.PARQUET, write_disposition=bigquery.WriteDisposition.WRITE_TRUNCATE)
+
         with open(parquet_file, "rb") as source_file:
             job = client.load_table_from_file(source_file, table_ref, job_config=job_config)
-
-        # Wait for the load job to complete
         job.result()
 
-        # Download table schema
         download_table_schema(table)
+        schema_file = get_latest_schema_file(table)
+        if schema_file:
+            update_bigquery_schema_from_json(client, f"{os.getenv('PROJECT')}.{os.getenv('DATASET')}.{table}", schema_file)
+        else:
+            logging.warning(f"No schema file found for table {table} to update BQ schema.")
 
-        update_bigquery_schema_from_json(client, f"{os.getenv('PROJECT')}.{os.getenv('DATASET')}.{table}", get_latest_schema_file(table))
+        logging.info(f"✅ Table '{table}' successfully loaded into BigQuery.")
 
-        logging.info(f"Table {table} loaded to BigQuery.")
-
-        # Clean up downloaded files
+        # Cleanup
         os.remove(parquet_file)
         shutil.rmtree(os.path.dirname(parquet_file))
     except Exception as e:

@@ -1,4 +1,4 @@
-FROM python:3.8-slim-buster
+FROM python:3.11-slim-buster
 
 WORKDIR /app
 
@@ -7,7 +7,7 @@ COPY downloads ./downloads
 COPY requirements.txt ./
 RUN pip install -r requirements.txt
 
-RUN python -m pip install instructure-dap-client --upgrade --upgrade-strategy=eager
+RUN python -m pip install instructure-dap-client
 
 COPY main.py .
 
